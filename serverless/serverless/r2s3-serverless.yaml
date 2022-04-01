@@ -1,0 +1,1967 @@
+Description: IVS Record to S3
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: IVS
+        Parameters:
+          - IvsChannelName
+          - Title
+          - Description
+      - Label:
+          default: API Gateway
+        Parameters:
+          - StageName
+Outputs:
+  ApiGatewayStageUrl:
+    Description: The URL to invoke the API Gateway.
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+  IvsChannelArn:
+    Description: This is the ARN of the IVS channel.
+    Value: !Ref 'IVSChannel'
+  IvsChannelIngestEndpointOutput:
+    Description: Channel ingest endpoint, part of the definition of an ingest server,
+      used when you set up streaming software.
+    Value: !Sub
+      - rtmps://${Endpoint}/app
+      - Endpoint: !GetAtt 'IVSChannel.IngestEndpoint'
+  IvsChannelPlaybackUrlOutput:
+    Description: This is the channel playback URL.
+    Value: !GetAtt 'IVSChannel.PlaybackUrl'
+  IvsStorageBucketName:
+    Description: This is the name of the buckets where IVS will store your videos.
+    Value: !Ref 'IvsStorageBucket'
+  IvsStreamKey:
+    Description: Use this stream key to initiate a live stream. DO NOT store your
+      keys as stack outputs on a production environment.
+    Value: !GetAtt 'IVSStreamKey.Value'
+  IvsStreamKeyArn:
+    Description: The ARN of the Amazon IVS stream key associated with the channel.
+    Value: !Ref 'IVSStreamKey'
+Parameters:
+  Description:
+    Default: Subtitle
+    Description: The subtitle of the live broadcasting.
+    MinLength: 1
+    Type: String
+  IvsChannelName:
+    Default: IVS-Channel
+    Description: The name of the IVS Channel.
+    Type: String
+  StageName:
+    Default: api
+    Description: A name for the stage that API Gateway creates with this deployment.
+      Use only alphanumeric characters.
+    MinLength: 1
+    Type: String
+  Title:
+    Default: Title
+    Description: The title of the live broadcasting.
+    MinLength: 1
+    Type: String
+Resources:
+  ApiGateway:
+    Properties:
+      Cors:
+        AllowMethods: '''GET,POST,PUT,OPTIONS'''
+        AllowOrigin: '''*'''
+      StageName: !Ref 'StageName'
+    Type: AWS::Serverless::Api
+  CheckLiveCronLambda:
+    Properties:
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+      Handler: index.isLiveCron
+      InlineCode: !Join
+        - ''
+        - - "\n"
+          - "\n"
+          - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  CHANNELS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "\n"
+          - "const ivs = new AWS.IVS({\n"
+          - "    apiVersion: '2020-07-14',\n"
+          - "    REGION // Must be in one of the supported regions\n"
+          - "  });\n"
+          - "  \n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "\n"
+          - "const _updateDDBChannelIsLive = async (isLive, id, stream) => {\n"
+          - "\n"
+          - "    try {\n"
+          - "      const params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          'Id': {\n"
+          - "            S: id\n"
+          - "          },\n"
+          - "        },\n"
+          - "        ExpressionAttributeNames: {\n"
+          - "          '#IsLive': 'IsLive',\n"
+          - "          '#ChannelStatus': 'ChannelStatus',\n"
+          - "          '#Viewers': 'Viewers'\n"
+          - "        },\n"
+          - "        ExpressionAttributeValues: {\n"
+          - "          ':isLive': {\n"
+          - "            BOOL: isLive\n"
+          - "          },\n"
+          - "          ':channelStatus': {\n"
+          - "            S: stream ? JSON.stringify(stream) : '{}'\n"
+          - "          },\n"
+          - "          ':viewers': {\n"
+          - "            N: stream ? String(stream.viewerCount) : String(0)\n"
+          - "          }\n"
+          - "        },\n"
+          - "        UpdateExpression: 'SET #IsLive = :isLive, #ChannelStatus = :channelStatus,\
+            \ #Viewers = :viewers',\n"
+          - "        ReturnValues: \"ALL_NEW\"\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"_updateDDBChannelIsLive > params:\", JSON.stringify(params,\
+            \ null, 2));\n"
+          - "  \n"
+          - "      const result = await ddb.updateItem(params).promise();\n"
+          - "  \n"
+          - "      return result;\n"
+          - "    } catch (err) {\n"
+          - "      console.info(\"_updateDDBChannelIsLive > err:\", err, err.stack);\n"
+          - "      throw new Error(err);\n"
+          - "    }\n"
+          - "  \n"
+          - "  };\n"
+          - "  \n"
+          - "  const _isLive = async (counter) => {\n"
+          - "    console.info(\"_isLive > counter:\", counter);\n"
+          - "  \n"
+          - "    const liveStreams = await ivs.listStreams({}).promise();\n"
+          - "    console.info(\"_isLive > liveStreams:\", liveStreams);\n"
+          - "  \n"
+          - "    if (!liveStreams) {\n"
+          - "      console.log(\"_isLive: No live streams. Nothing to check\");\n"
+          - "      return;\n"
+          - "    }\n"
+          - "  \n"
+          - "    const result = await ddb.scan({ TableName: CHANNELS_TABLE_NAME }).promise();\n"
+          - "    if (!result.Items) {\n"
+          - "      console.log(\"_isLive: No channels. Nothing to check\");\n"
+          - "      return;\n"
+          - "    }\n"
+          - "  \n"
+          - "    let len = result.Items.length;\n"
+          - "    while (--len >= 0) {\n"
+          - "  \n"
+          - "      const channelArn = result.Items[len].ChannelArn.S;\n"
+          - "  \n"
+          - "      console.log(\"_isLive > channel:\", channelArn);\n"
+          - "      const liveStream = liveStreams.streams.find(obj => obj.channelArn\
+            \ === channelArn);\n"
+          - "      console.log(\"_isLive > liveStream:\", JSON.stringify(liveStream,\
+            \ null, 2));\n"
+          - "  \n"
+          - "      await _updateDDBChannelIsLive((liveStream ? true : false), result.Items[len].Id.S,\
+            \ liveStream);\n"
+          - "  \n"
+          - "    }\n"
+          - "  };\n"
+          - "  /* Cloudwatch event */\n"
+          - "  exports.isLiveCron = async (event) => {\n"
+          - "    console.log(\"isLiveCron event:\", JSON.stringify(event, null, 2));\n"
+          - "  \n"
+          - "    // Run three times before the next scheduled event every 1 minute\n"
+          - "    const waitTime = 3 * 1000; // 3 seconds\n"
+          - "    let i = 0;\n"
+          - "    _isLive(i + 1); // run immediately\n"
+          - "    for (i; i < 2; i++) {\n"
+          - "      await new Promise(r => setTimeout(r, waitTime)); // wait 3 seconds\n"
+          - "      console.log(\"isLiveCron event: waited 3 seconds\");\n"
+          - "      _isLive(i + 1);\n"
+          - "    }\n"
+          - "  \n"
+          - "    console.log(\"isLiveCron event: end\");\n"
+          - "  \n"
+          - "    return;\n"
+          - '  };'
+      Role: !GetAtt 'CheckLiveCronLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  CheckLiveCronLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ivs:ListStreams
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:ivs:${AWS::Region}:${AWS::AccountId}:channel/*'
+            Version: '2012-10-17'
+          PolicyName: ivs-access
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:ListTables
+                  - dynamodb:Scan
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSChannelTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  CloudFrontBucketPolicy:
+    DependsOn:
+      - CloudFrontOriginAccessIdentity
+    Properties:
+      Bucket: !Ref 'IvsStorageBucket'
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - arn:${AWS::Partition}:iam::cloudfront:user/CloudFront Origin Access
+                  Identity ${Identity}
+                - Identity: !Ref 'CloudFrontOriginAccessIdentity'
+            Resource:
+              - !Sub
+                - ${BucketArn}/*
+                - BucketArn: !GetAtt 'IvsStorageBucket.Arn'
+    Type: AWS::S3::BucketPolicy
+  CloudFrontDistribution:
+    DependsOn:
+      - CloudFrontOriginAccessIdentity
+    Properties:
+      DistributionConfig:
+        Comment: IVS Storage CloudFront Distribution
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            Headers:
+              - Access-Control-Request-Headers
+              - Access-Control-Request-Method
+            QueryString: 'false'
+          TargetOriginId: IVS Storage Origin
+          ViewerProtocolPolicy: allow-all
+        Enabled: 'true'
+        Origins:
+          - DomainName: !GetAtt 'IvsStorageBucket.DomainName'
+            Id: IVS Storage Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub
+                - origin-access-identity/cloudfront/${OriginAccessId}
+                - OriginAccessId: !Ref 'CloudFrontOriginAccessIdentity'
+    Type: AWS::CloudFront::Distribution
+  CloudFrontOriginAccessIdentity:
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: CF Identity - IVS Storage Bucket
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+  CreateChannelLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ivs:GetChannel
+                  - ivs:GetStream
+                Effect: Allow
+                Resource:
+                  - !Ref 'IVSChannel'
+              - Action:
+                  - ivs:CreateChannel
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:ivs:${AWS::Region}:${AWS::AccountId}:*'
+              - Action:
+                  - ivs:GetStreamKey
+                Effect: Allow
+                Resource:
+                  - !Ref 'IVSStreamKey'
+            Version: '2012-10-17'
+          PolicyName: ivs-streamkey-access
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSChannelTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  DeleteVideo:
+    Properties:
+      Environment:
+        Variables:
+          REGION: !Ref 'AWS::Region'
+          VIDEOS_TABLE_NAME: !Ref 'IVSVideoTable'
+      Events:
+        DeleteResource:
+          Properties:
+            Method: delete
+            Path: /video/{id}
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.deleteRecordedVideo
+      InlineCode: !Join
+        - ''
+        - - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  VIDEOS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "const ivs = new AWS.IVS({\n"
+          - "  apiVersion: '2020-07-14',\n"
+          - "  REGION // Must be in one of the supported regions\n"
+          - "});\n"
+          - "\n"
+          - "const S3 = new AWS.S3({\n"
+          - "    apiVersion: '2006-03-01'\n"
+          - "  });\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "\n"
+          - "// DELETE /video/:id\n"
+          - "exports.deleteRecordedVideo = async (event) => {\n"
+          - "    try {\n"
+          - "      if (!event.pathParameters.id) {\n"
+          - "        return response({ message: 'Missing id' }, 400);\n"
+          - "      }\n"
+          - "  \n"
+          - "      let params = {\n"
+          - "        TableName: VIDEOS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          \"Id\": {\n"
+          - "            S: event.pathParameters.id\n"
+          - "          }\n"
+          - "        }\n"
+          - "  \n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"deleteRecordedVideo > params:\", params);\n"
+          - "  \n"
+          - "      let dbResult = await ddb.getItem(params).promise();\n"
+          - "  \n"
+          - "      if ((!result.Item.RecordingConfiguration || !result.Item.RecordingConfiguration.S)\
+            \ || (!result.Item.RecordedFilename || !result.Items.RecordedFilename.S))\
+            \ {\n"
+          - "        return response(\"No recording!\", 500);\n"
+          - "      }\n"
+          - "  \n"
+          - "      const r2s3 = JSON.parse(result.Item.RecordingConfiguration.S);\n"
+          - "  \n"
+          - "      params = {\n"
+          - "        Bucket: r2s3.bucketName,\n"
+          - "        Key: result.Item.RecordedFilename.S\n"
+          - "      };\n"
+          - "      const s3Result = await S3.deleteObject(params).promise();\n"
+          - "  \n"
+          - "  \n"
+          - "      dbResult = await ddb.deleteItem(params).promise();\n"
+          - "  \n"
+          - "      return response({ dbResult, s3Result });\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"deleteRecordedVideo > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "  \n"
+          - "    }\n"
+          - '  };'
+      Role: !GetAtt 'DeleteVideoLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  DeleteVideoLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSVideoTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  GetLive:
+    Properties:
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+      Events:
+        GetResource:
+          Properties:
+            Method: get
+            Path: /live
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.getLiveChannels
+      InlineCode: !Join
+        - ''
+        - - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  CHANNELS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "  return {\n"
+          - "    statusCode,\n"
+          - "    headers: {\n"
+          - "      'Content-Type': 'application/json',\n"
+          - "      'Access-Control-Allow-Origin': '*'\n"
+          - "    },\n"
+          - "    body: JSON.stringify(body)\n"
+          - "  };\n"
+          - "};\n"
+          - "\n"
+          - "// GET /live\n"
+          - "exports.getLiveChannels = async (event) => {\n"
+          - "  console.log(\"getLiveChannels:\", JSON.stringify(event, null, 2));\n"
+          - "\n"
+          - "  try {\n"
+          - "\n"
+          - "\n"
+          - "\n"
+          - "    if (event.queryStringParameters && event.queryStringParameters.channelName)\
+            \ {\n"
+          - "      console.log(\"getLiveChannels > by channelName\");\n"
+          - "      let params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          \"Id\": {\n"
+          - "            S: event.queryStringParameters.channelName\n"
+          - "          }\n"
+          - "        }\n"
+          - "\n"
+          - "      };\n"
+          - "\n"
+          - "      console.info(\"getLiveChannels > by channelName > params:\", JSON.stringify(params,\
+            \ null, 2));\n"
+          - "\n"
+          - "      const result = await ddb.getItem(params).promise();\n"
+          - "\n"
+          - "      console.info(\"getLiveChannels > by channelName > result:\", JSON.stringify(result,\
+            \ null, 2));\n"
+          - "\n"
+          - "      // empty\n"
+          - "      if (!result.Item) {\n"
+          - "        return response({});\n"
+          - "      }\n"
+          - "\n"
+          - "      // there is only one live stream per channel at time\n"
+          - "      const stream = JSON.parse(result.Item.ChannelStatus.S);\n"
+          - "      console.log(JSON.stringify(stream));\n"
+          - "      // removes types\n"
+          - "      const data = {\n"
+          - "        \"data\": {\n"
+          - "          id : result.Item.Id ? result.Item.Id.S : '',\n"
+          - "          channelArn: result.Item.ChannelArn ? result.Item.ChannelArn.S\
+            \ : '',\n"
+          - "          title: result.Item.Title ? result.Item.Title.S : '',\n"
+          - "          subtitle: result.Item.Subtitle ? result.Item.Subtitle.S : '',\n"
+          - "          thumbnail: '',\n"
+          - "          isLive: result.Item.IsLive && result.Item.IsLive.BOOL ? 'Yes'\
+            \ : 'No',\n"
+          - "          viewers: stream.viewerCount ? stream.viewerCount : 0,\n"
+          - "          playbackUrl: result.Item.PlaybackUrl ? result.Item.PlaybackUrl.S\
+            \ : ''\n"
+          - "        }\n"
+          - "      };\n"
+          - "\n"
+          - "      console.info(\"getLiveChannels > by channelName > response:\",\
+            \ JSON.stringify(data, null, 2));\n"
+          - "\n"
+          - "      return response(data);\n"
+          - "    }\n"
+          - "\n"
+          - "    console.log(\"getLiveChannels > list\");\n"
+          - "\n"
+          - "    const scanParams = {\n"
+          - "      \"TableName\": CHANNELS_TABLE_NAME\n"
+          - "    };\n"
+          - "\n"
+          - "\n"
+          - "\n"
+          - "    console.info(\"getLiveChannels > list > params:\", JSON.stringify(scanParams,\
+            \ null, 2));\n"
+          - "\n"
+          - "    const result = await ddb.scan(scanParams).promise();\n"
+          - "\n"
+          - "    console.info(\"getLiveChannels > list > result:\", JSON.stringify(result,\
+            \ null, 2));\n"
+          - "\n"
+          - "    // empty\n"
+          - "    if (!result.Items) {\n"
+          - "      return response([]);\n"
+          - "    }\n"
+          - "\n"
+          - "    // removes types\n"
+          - "    let channelLive = result.Items[0];\n"
+          - "    let stream = {};\n"
+          - "    try {\n"
+          - "      stream = JSON.parse(channelLive.ChannelStatus.S);\n"
+          - "    } catch (err) { }\n"
+          - "\n"
+          - "    const data = {\n"
+          - "      \"data\": {\n"
+          - "        id : channelLive.Id ? channelLive.Id.S : '',\n"
+          - "        channelArn: channelLive.ChannelArn ? channelLive.ChannelArn.S\
+            \ : '',\n"
+          - "        title: channelLive.Title ? channelLive.Title.S : '',\n"
+          - "        subtitle: channelLive.Subtitle ? channelLive.Subtitle.S : '',\n"
+          - "        thumbnail: '',\n"
+          - "        isLive: channelLive.IsLive && channelLive.IsLive.BOOL ? 'Yes'\
+            \ : 'No',\n"
+          - "        viewers: stream.viewerCount ? stream.viewerCount : 0,\n"
+          - "        playbackUrl: result.Items[0].PlaybackUrl ? result.Items[0].PlaybackUrl.S\
+            \ : ''\n"
+          - "      }\n"
+          - "    };\n"
+          - "\n"
+          - "    console.info(\"getLiveChannels > list > response:\", JSON.stringify(data,\
+            \ null, 2));\n"
+          - "\n"
+          - "    return response(data);\n"
+          - "\n"
+          - "  } catch (err) {\n"
+          - "    console.info(\"getLiveChannels > err:\", err);\n"
+          - "    return response(err, 500);\n"
+          - "  }\n"
+          - "};\n"
+      Policies: AmazonDynamoDBReadOnlyAccess
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  GetLiveDetails:
+    Properties:
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+      Events:
+        GetResource:
+          Properties:
+            Method: get
+            Path: /live-details
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.getLiveChannelDetails
+      InlineCode: !Join
+        - ''
+        - - "\n"
+          - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  CHANNELS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "const ivs = new AWS.IVS({\n"
+          - "  apiVersion: '2020-07-14',\n"
+          - "  REGION // Must be in one of the supported regions\n"
+          - "});\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "// GET /live-details\n"
+          - "exports.getLiveChannelDetails = async (event) => {\n"
+          - "    console.log(\"getLiveChannelDetails:\", JSON.stringify(event, null,\
+            \ 2));\n"
+          - "  \n"
+          - "    try {\n"
+          - "  \n"
+          - "      if (!event.queryStringParameters.channelName) {\n"
+          - "        return response({ message: 'Missing channelName' }, 400);\n"
+          - "      }\n"
+          - "  \n"
+          - "      let params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          \"Id\": {\n"
+          - "            S: event.queryStringParameters.channelName\n"
+          - "          }\n"
+          - "        }\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"getLiveChannelDetails > by channelName > params:\"\
+            , JSON.stringify(params, null, 2));\n"
+          - "  \n"
+          - "      const result = await ddb.getItem(params).promise();\n"
+          - "  \n"
+          - "      console.info(\"getLiveChannelDetails > by channelName > result:\"\
+            , JSON.stringify(result, null, 2));\n"
+          - "  \n"
+          - "      // empty\n"
+          - "      if (!result.Item) {\n"
+          - "        return response({});\n"
+          - "      }\n"
+          - "  \n"
+          - "      console.log(`channel  ${JSON.stringify(result)}`);\n"
+          - "  \n"
+          - "      const channel = result.Item;\n"
+          - "  \n"
+          - "      const streamObj = await ivs.getStreamKey({ arn: channel.StreamArn.S\
+            \ }).promise();\n"
+          - "      const channelObj = await ivs.getChannel({ arn: channel.ChannelArn.S\
+            \ }).promise();\n"
+          - "  \n"
+          - "      console.log(`stream object  ${JSON.stringify(streamObj)}`);\n"
+          - "      console.log(`channel object  ${JSON.stringify(channelObj)}`);\n"
+          - "  \n"
+          - "      const finalResult = {\n"
+          - "        \"data\": {\n"
+          - "          ingest: channelObj.channel.ingestEndpoint,\n"
+          - "          key: streamObj.streamKey.value\n"
+          - "        }\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"getLiveChannelDetails > by channelName > response:\"\
+            , JSON.stringify(finalResult, null, 2));\n"
+          - "      return response(finalResult, 200);\n"
+          - "  \n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"getLiveChannelDetails > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "  \n"
+          - "    }\n"
+          - '  };'
+      Role: !GetAtt 'GetLiveDetailsLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  GetLiveDetailsLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ivs:ListStreamsKeys
+                  - ivs:GetChannel
+                  - ivs:GetStream
+                Effect: Allow
+                Resource:
+                  - !Ref 'IVSChannel'
+              - Action:
+                  - ivs:GetStreamKey
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:ivs:${AWS::Region}:${AWS::AccountId}:stream-key/*'
+            Version: '2012-10-17'
+          PolicyName: ivs-streamkey-access
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSChannelTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  GetVideo:
+    Properties:
+      Environment:
+        Variables:
+          REGION: !Ref 'AWS::Region'
+          VIDEOS_TABLE_NAME: !Ref 'IVSVideoTable'
+      Events:
+        PutResource:
+          Properties:
+            Method: get
+            Path: /video/{id}
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.getVideos
+      InlineCode: !Join
+        - ''
+        - - "\n"
+          - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  VIDEOS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "\n"
+          - "// GET /videos and /video/:id\n"
+          - "exports.getVideos = async (event) => {\n"
+          - "    console.log(\"getVideos:\", JSON.stringify(event, null, 2));\n"
+          - "  \n"
+          - "    try {\n"
+          - "  \n"
+          - "  \n"
+          - "      if (event.pathParameters && event.pathParameters.id) {\n"
+          - "        console.log(\"getVideos > by id\");\n"
+          - "  \n"
+          - "        const params = {\n"
+          - "          TableName: VIDEOS_TABLE_NAME,\n"
+          - "          Key: {\n"
+          - "            'Id': {\n"
+          - "              'S': event.pathParameters.id\n"
+          - "            }\n"
+          - "          }\n"
+          - "        };\n"
+          - "  \n"
+          - "        console.info(\"getVideos > by id > params:\", JSON.stringify(params,\
+            \ null, 2));\n"
+          - "  \n"
+          - "        const result = await ddb.getItem(params).promise();\n"
+          - "  \n"
+          - "        console.info(\"getVideos > by id > result:\", JSON.stringify(result,\
+            \ null, 2));\n"
+          - "  \n"
+          - "        // empty\n"
+          - "        if (!result.Item) {\n"
+          - "          return response(null, 404);\n"
+          - "        }\n"
+          - "  \n"
+          - "        // removes types\n"
+          - "        const filtered = {\n"
+          - "          title: result.Item.Title ? result.Item.Title.S : '',\n"
+          - "          subtitle: result.Item.Subtitle ? result.Item.Subtitle.S : '',\n"
+          - "          id: result.Item.Id.S,\n"
+          - "          created_on: result.Item.CreatedOn ? result.Item.CreatedOn.S\
+            \ : '',\n"
+          - "          playbackUrl: result.Item.PlaybackUrl ? result.Item.PlaybackUrl.S\
+            \ : '',\n"
+          - "          thumbnail: result.Item.Thumbnail ? result.Item.Thumbnail.S\
+            \ : '',\n"
+          - "          thumbnails: result.Item.Thumbnails ? result.Item.Thumbnails.SS\
+            \ : [],\n"
+          - "          views: result.Item.Viewers ? result.Item.Viewers.N : 0,\n"
+          - "          length: result.Item.Length ? result.Item.Length.S : ''\n"
+          - "        };\n"
+          - "  \n"
+          - "  \n"
+          - "  \n"
+          - "        console.info(\"getVideos > by Id > response:\", JSON.stringify(filtered,\
+            \ null, 2));\n"
+          - "  \n"
+          - "        return response(filtered);\n"
+          - "  \n"
+          - "      }\n"
+          - "  \n"
+          - "      const result = await ddb.scan({ TableName: VIDEOS_TABLE_NAME }).promise();\n"
+          - "  \n"
+          - "  \n"
+          - "      console.info(\"getVideos > result:\", JSON.stringify(result, null,\
+            \ 2));\n"
+          - "  \n"
+          - "      // empty\n"
+          - "      if (!result.Items) {\n"
+          - "        return response({ \"vods\": [] });\n"
+          - "      }\n"
+          - "  \n"
+          - "      // removes types\n"
+          - "      let filteredItem;\n"
+          - "      let filteredItems = [];\n"
+          - "      let prop;\n"
+          - "      for (prop in result.Items) {\n"
+          - "        filteredItem = {\n"
+          - "          id: result.Items[prop].Id.S,\n"
+          - "          title: result.Items[prop].Title.S,\n"
+          - "          subtitle: result.Items[prop].Subtitle.S,\n"
+          - "          created_on: result.Items[prop].CreatedOn.S,\n"
+          - "          playbackUrl: result.Items[prop].PlaybackUrl.S,\n"
+          - "          thumbnail: result.Items[prop].Thumbnail ? result.Items[prop].Thumbnail.S\
+            \ : '',\n"
+          - "          thumbnails: result.Items[prop].Thumbnails ? result.Items[prop].Thumbnails.SS\
+            \ : [],\n"
+          - "          views: result.Items[prop].Viewers ? result.Items[prop].Viewers.N\
+            \ : 0,\n"
+          - "          length: result.Items[prop].Length ? result.Items[prop].Length.S\
+            \ : ''\n"
+          - "        };\n"
+          - "  \n"
+          - "  \n"
+          - "        filteredItems.push(filteredItem);\n"
+          - "  \n"
+          - "      }\n"
+          - "  \n"
+          - "      console.info(\"getVideos > response:\", JSON.stringify(filteredItems,\
+            \ null, 2));\n"
+          - "      return response({ \"vods\": filteredItems });\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"getVideos > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "  \n"
+          - "    }\n"
+          - '  };'
+      Policies:
+        - DynamoDBReadPolicy
+      Role: !GetAtt 'GetVideoLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  GetVideoLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ivs:ListStreams
+                  - ivs:GetStream
+                Effect: Allow
+                Resource:
+                  - !Ref 'IVSChannel'
+            Version: '2012-10-17'
+          PolicyName: ivs-streamkey-access
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSVideoTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  GetVideos:
+    Properties:
+      Environment:
+        Variables:
+          REGION: !Ref 'AWS::Region'
+          VIDEOS_TABLE_NAME: !Ref 'IVSVideoTable'
+      Events:
+        GetResource:
+          Properties:
+            Method: get
+            Path: /videos
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.getVideos
+      InlineCode: !Join
+        - ''
+        - - "\n"
+          - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  VIDEOS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "\n"
+          - "// GET /videos and /video/:id\n"
+          - "exports.getVideos = async (event) => {\n"
+          - "    console.log(\"getVideos:\", JSON.stringify(event, null, 2));\n"
+          - "  \n"
+          - "    try {\n"
+          - "  \n"
+          - "  \n"
+          - "      if (event.pathParameters && event.pathParameters.id) {\n"
+          - "        console.log(\"getVideos > by id\");\n"
+          - "  \n"
+          - "        const params = {\n"
+          - "          TableName: VIDEOS_TABLE_NAME,\n"
+          - "          Key: {\n"
+          - "            'Id': {\n"
+          - "              'S': event.pathParameters.id\n"
+          - "            }\n"
+          - "          }\n"
+          - "        };\n"
+          - "  \n"
+          - "        console.info(\"getVideos > by id > params:\", JSON.stringify(params,\
+            \ null, 2));\n"
+          - "  \n"
+          - "        const result = await ddb.getItem(params).promise();\n"
+          - "  \n"
+          - "        console.info(\"getVideos > by id > result:\", JSON.stringify(result,\
+            \ null, 2));\n"
+          - "  \n"
+          - "        // empty\n"
+          - "        if (!result.Item) {\n"
+          - "          return response(null, 404);\n"
+          - "        }\n"
+          - "  \n"
+          - "        // removes types\n"
+          - "        const filtered = {\n"
+          - "          title: result.Item.Title ? result.Item.Title.S : '',\n"
+          - "          subtitle: result.Item.Subtitle ? result.Item.Subtitle.S : '',\n"
+          - "          id: result.Item.Id.S,\n"
+          - "          created_on: result.Item.CreatedOn ? result.Item.CreatedOn.S\
+            \ : '',\n"
+          - "          playbackUrl: result.Item.PlaybackUrl ? result.Item.PlaybackUrl.S\
+            \ : '',\n"
+          - "          thumbnail: result.Item.Thumbnail ? result.Item.Thumbnail.S\
+            \ : '',\n"
+          - "          thumbnails: result.Item.Thumbnails ? result.Item.Thumbnails.SS\
+            \ : [],\n"
+          - "          views: result.Item.Viewers ? result.Item.Viewers.N : 0,\n"
+          - "          length: result.Item.Length ? result.Item.Length.S : ''\n"
+          - "        };\n"
+          - "  \n"
+          - "  \n"
+          - "  \n"
+          - "        console.info(\"getVideos > by Id > response:\", JSON.stringify(filtered,\
+            \ null, 2));\n"
+          - "  \n"
+          - "        return response(filtered);\n"
+          - "  \n"
+          - "      }\n"
+          - "  \n"
+          - "      const result = await ddb.scan({ TableName: VIDEOS_TABLE_NAME }).promise();\n"
+          - "  \n"
+          - "  \n"
+          - "      console.info(\"getVideos > result:\", JSON.stringify(result, null,\
+            \ 2));\n"
+          - "  \n"
+          - "      // empty\n"
+          - "      if (!result.Items) {\n"
+          - "        return response({ \"vods\": [] });\n"
+          - "      }\n"
+          - "  \n"
+          - "      // removes types\n"
+          - "      let filteredItem;\n"
+          - "      let filteredItems = [];\n"
+          - "      let prop;\n"
+          - "      for (prop in result.Items) {\n"
+          - "        filteredItem = {\n"
+          - "          id: result.Items[prop].Id.S,\n"
+          - "          title: result.Items[prop].Title.S,\n"
+          - "          subtitle: result.Items[prop].Subtitle.S,\n"
+          - "          created_on: result.Items[prop].CreatedOn.S,\n"
+          - "          playbackUrl: result.Items[prop].PlaybackUrl.S,\n"
+          - "          thumbnail: result.Items[prop].Thumbnail ? result.Items[prop].Thumbnail.S\
+            \ : '',\n"
+          - "          thumbnails: result.Items[prop].Thumbnails ? result.Items[prop].Thumbnails.SS\
+            \ : [],\n"
+          - "          views: result.Items[prop].Viewers ? result.Items[prop].Viewers.N\
+            \ : 0,\n"
+          - "          length: result.Items[prop].Length ? result.Items[prop].Length.S\
+            \ : ''\n"
+          - "        };\n"
+          - "  \n"
+          - "  \n"
+          - "        filteredItems.push(filteredItem);\n"
+          - "  \n"
+          - "      }\n"
+          - "  \n"
+          - "      console.info(\"getVideos > response:\", JSON.stringify(filteredItems,\
+            \ null, 2));\n"
+          - "      return response({ \"vods\": filteredItems });\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"getVideos > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "  \n"
+          - "    }\n"
+          - '  };'
+      Role: !GetAtt 'GetVideosLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  GetVideosLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ivs:ListStreams
+                  - ivs:GetStream
+                Effect: Allow
+                Resource:
+                  - !Ref 'IVSChannel'
+            Version: '2012-10-17'
+          PolicyName: ivs-streamkey-access
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSVideoTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  IVSChannel:
+    Properties:
+      Name: !Ref 'IvsChannelName'
+      RecordingConfigurationArn: !GetAtt 'IvsRecordingConfiguration.Arn'
+    Type: AWS::IVS::Channel
+  IVSChannelRule:
+    Properties:
+      Description: Rule to monitor IVS streams.
+      EventPattern:
+        detail-type:
+          - IVS Stream State Change
+        resources:
+          - !Ref 'IVSChannel'
+        source:
+          - aws.ivs
+      Targets:
+        - Arn: !GetAtt 'IVSStreamingStateChangeLambda.Arn'
+          Id: IVS-channel-streaming-state-change
+    Type: AWS::Events::Rule
+  IVSChannelTable:
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: IVS-Channel
+    Type: AWS::DynamoDB::Table
+  IVSRecordingConfigurationRule:
+    Properties:
+      Description: Rule to monitor IVS Recordings.
+      EventPattern:
+        detail-type:
+          - IVS Recording State Change
+        source:
+          - aws.ivs
+      Targets:
+        - Arn: !GetAtt 'IVSStreamingStateChangeLambda.Arn'
+          Id: IVS-channel-recording-state-change
+    Type: AWS::Events::Rule
+  IVSRecordingStateChangeLambdaInvokePermission:
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !Ref 'IVSStreamingStateChangeLambda'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 'IVSRecordingConfigurationRule.Arn'
+    Type: AWS::Lambda::Permission
+  IVSStreamKey:
+    Properties:
+      ChannelArn: !Ref 'IVSChannel'
+    Type: AWS::IVS::StreamKey
+  IVSStreamingStateChangeLambda:
+    Properties:
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+          STORAGE_URL: !Sub
+            - https://${CloudFrontDomainName}
+            - CloudFrontDomainName: !GetAtt 'CloudFrontDistribution.DomainName'
+          VIDEOS_TABLE_NAME: !Ref 'IVSVideoTable'
+      Handler: index.customEventFromEventBridge
+      InlineCode: !Join
+        - ''
+        - - "const AWS = require('aws-sdk');\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  CHANNELS_TABLE_NAME,\n"
+          - "  STORAGE_URL,\n"
+          - "  VIDEOS_TABLE_NAME\n"
+          - "} = process.env;\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "exports.customEventFromEventBridge = async (event) => {\n"
+          - "    console.log(\"Stream State Change:\", JSON.stringify(event, null,\
+            \ 2));\n"
+          - "    const params = {TableName: CHANNELS_TABLE_NAME, Key: {'Id': {S: event.detail.channel_name}}};\n"
+          - "    const channel = await ddb.getItem(params).promise();\n"
+          - "\n"
+          - "    if (event.detail.event_name == \"Stream Start\") {\n"
+          - "      try {\n"
+          - "        await _updateDDBChannelIsLive(true, event.detail.channel_name);\n"
+          - "        return;\n"
+          - "      } catch (err) {\n"
+          - "        console.info(\"Stream Start>err:\", err, err.stack);\n"
+          - "        throw new Error(err);\n"
+          - "      }\n"
+          - "    }\n"
+          - "  \n"
+          - "    if (event.detail.event_name == \"Stream End\") {\n"
+          - "      try {\n"
+          - "        await _updateDDBChannelIsLive(false, event.detail.channel_name);\n"
+          - "        return;\n"
+          - "      } catch (err) {\n"
+          - "        console.info(\"Stream End> err:\", err, err.stack);\n"
+          - "        throw new Error(err);\n"
+          - "      }\n"
+          - "    }\n"
+          - "  \n"
+          - "    if (event.detail.recording_status == \"Recording End\") {\n"
+          - "      try {\n"
+          - "        let payload = {\n"
+          - "          id: event.detail.stream_id,\n"
+          - "          channelName: event.detail.channel_name,\n"
+          - "          title: channel.Item.Title.S,\n"
+          - "          subtitle: channel.Item.Subtitle.S,\n"
+          - "          length: msToTime(event.detail.recording_duration_ms),\n"
+          - "          createOn: event.time,\n"
+          - "          playbackUrl: `${STORAGE_URL}/${event.detail.recording_s3_key_prefix}/media/hls/master.m3u8`,\n"
+          - "          viewers: channel.Item.Viewers.N,\n"
+          - "          thumbnail: `${STORAGE_URL}/${event.detail.recording_s3_key_prefix}/media/thumbnails/thumb0.jpg`,\n"
+          - "          thumbnails: [\n"
+          - "            `${STORAGE_URL}/${event.detail.recording_s3_key_prefix}/media/thumbnails/thumb0.jpg`,\n"
+          - "            `${STORAGE_URL}/${event.detail.recording_s3_key_prefix}/media/thumbnails/thumb1.jpg`,\n"
+          - "            `${STORAGE_URL}/${event.detail.recording_s3_key_prefix}/media/thumbnails/thumb2.jpg`,\n"
+          - "          ]\n"
+          - "        };\n"
+          - "        await _createDdbVideo(payload);\n"
+          - "        return;\n"
+          - "      } catch (err) {\n"
+          - "        console.info(\"Recording End > err:\", err, err.stack);\n"
+          - "        throw new Error(err);\n"
+          - "      }\n"
+          - "    }\n"
+          - "    return;\n"
+          - "};\n"
+          - "const _createDdbVideo = async (payload) => {\n"
+          - "    try {\n"
+          - "      const result = await ddb.putItem({\n"
+          - "        TableName: VIDEOS_TABLE_NAME,\n"
+          - "        Item: {'Id': { S: payload.id }, 'Channel': { S: payload.channelName\
+            \ },'Title': { S: payload.title },'Subtitle': { S: payload.subtitle },'CreatedOn':\
+            \ { S: payload.createOn },'PlaybackUrl': { S: payload.playbackUrl },'Viewers':\
+            \ { N: payload.viewers },'Length': { S: payload.length },'Thumbnail':\
+            \ { S: payload.thumbnail },'Thumbnails': { SS: payload.thumbnails },}}).promise();\n"
+          - "      return result;\n"
+          - "    } catch (err) {\n"
+          - "      console.info(\"_createDdbVideo > err:\", err, err.stack);\n"
+          - "      throw new Error(err);\n"
+          - "    }\n"
+          - "  };\n"
+          - "const _updateDDBChannelIsLive = async (isLive, id, stream) => {\n"
+          - "    try {\n"
+          - "      const params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          'Id': {\n"
+          - "            S: id\n"
+          - "          }\n"
+          - "        },\n"
+          - "        ExpressionAttributeNames: {'#IsLive': 'IsLive','#ChannelStatus':\
+            \ 'ChannelStatus','#Viewers': 'Viewers'},\n"
+          - "        ExpressionAttributeValues: {\n"
+          - "          ':isLive': { BOOL: isLive},\n"
+          - "          ':channelStatus': { S: stream ? JSON.stringify(stream) : '{}'},\n"
+          - "          ':viewers': { N: stream ? String(stream.viewerCount) : String(0)}\n"
+          - "        },\n"
+          - "        UpdateExpression: 'SET #IsLive = :isLive, #ChannelStatus = :channelStatus,\
+            \ #Viewers = :viewers',\n"
+          - "        ReturnValues: \"ALL_NEW\"\n"
+          - "    };\n"
+          - "    const result = await ddb.updateItem(params).promise();\n"
+          - "    return result;\n"
+          - "    } catch (err) {\n"
+          - "      console.info(\"Update Channel > err:\", err, err.stack);\n"
+          - "      throw new Error(err);\n"
+          - "    }\n"
+          - "};\n"
+          - "\n"
+          - function msToTime(e){function n(e,n){return("00"+e).slice(-(n=n||2))}var
+            r=e%1e3,i=(e=(e-r)/1e3)%60,t=(e=(e-i)/60)%60;return n((e-t)/60)+":"+n(t)+":"+n(i)+"."+n(r,3)}
+      Role: !GetAtt 'IvsStreamingStateChangeLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  IVSStreamingStateChangeLambdaInvokePermission:
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !Ref 'IVSStreamingStateChangeLambda'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 'IVSChannelRule.Arn'
+    Type: AWS::Lambda::Permission
+  IVSVideoTable:
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: IVS-Video
+    Type: AWS::DynamoDB::Table
+  IvsLiveCheckRule:
+    Properties:
+      Description: CloudWatch rule to invoke the IVS Live Check lambda.
+      ScheduleExpression: cron(0/1 * * * ? *)
+      Targets:
+        - Arn: !GetAtt 'CheckLiveCronLambda.Arn'
+          Id: invoke-live-check-lambda
+    Type: AWS::Events::Rule
+  IvsRecordingConfiguration:
+    Properties:
+      DestinationConfiguration:
+        S3:
+          BucketName: !Ref 'IvsStorageBucket'
+    Type: AWS::IVS::RecordingConfiguration
+  IvsStorageBucket:
+    DependsOn:
+      - CloudFrontOriginAccessIdentity
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - Access-Control-Allow-Origin
+            AllowedMethods:
+              - GET
+            AllowedOrigins:
+              - '*'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: 'true'
+        BlockPublicPolicy: 'true'
+        IgnorePublicAcls: 'true'
+        RestrictPublicBuckets: 'true'
+    Type: AWS::S3::Bucket
+  IvsStreamingStateChangeLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:PutItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSVideoTable}'
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSChannelTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  LiveCheckLambdaInvokePermission:
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !Ref 'CheckLiveCronLambda'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 'IvsLiveCheckRule.Arn'
+    Type: AWS::Lambda::Permission
+  LoadChannelInfoCustom:
+    DependsOn:
+      - IVSChannel
+      - IVSStreamKey
+      - IVSChannelTable
+    Properties:
+      ChannelArn: !Ref 'IVSChannel'
+      Id: !Sub '${IVSChannelTable}'
+      IngestServer: !GetAtt 'IVSChannel.IngestEndpoint'
+      PlaybackUrl: !GetAtt 'IVSChannel.PlaybackUrl'
+      ServiceToken: !GetAtt 'LoadChannelInfoLambda.Arn'
+      StreamArn: !Ref 'IVSStreamKey'
+      StreamKey: !GetAtt 'IVSStreamKey.Value'
+      Subtitle: !Ref 'Description'
+      Title: !Ref 'Title'
+    Type: Custom::LoadChannelInfo
+  LoadChannelInfoLambda:
+    Properties:
+      Code:
+        ZipFile: !Join
+          - ''
+          - - "const cfnResp = require(\"cfn-response\");\n"
+            - "const AWS = require(\"aws-sdk\");\n"
+            - "\n"
+            - "const ddb = new AWS.DynamoDB();\n"
+            - "\n"
+            - "exports.handler = async (event, context) => {\n"
+            - "    console.log(\"=========== event ===================\");\n"
+            - "    console.log(JSON.stringify(event));\n"
+            - "    console.log(\"=========== context ===================\");\n"
+            - "    console.log(JSON.stringify(context));\n"
+            - "\n"
+            - "    if (event.RequestType != \"Create\") {\n"
+            - "        return response(event, context, cfnResp.SUCCESS, {});\n"
+            - "    }\n"
+            - "\n"
+            - "    try{\n"
+            - "\n"
+            - "        let payload = {\n"
+            - "            id : event.ResourceProperties.Id,\n"
+            - "            channelArn : event.ResourceProperties.ChannelArn,\n"
+            - "            title : event.ResourceProperties.Title,\n"
+            - "            subtitle : event.ResourceProperties.Subtitle,\n"
+            - "            ingestServer : event.ResourceProperties.IngestServer,\n"
+            - "            playbackUrl : event.ResourceProperties.PlaybackUrl,\n"
+            - "            streamKey : event.ResourceProperties.StreamKey,\n"
+            - "            streamArn : event.ResourceProperties.StreamArn\n"
+            - "          };\n"
+            - "          \n"
+            - "        \n"
+            - "        const result = await _createDdbChannel(payload, process.env.CHANNELS_TABLE_NAME);\n"
+            - "        \n"
+            - "        console.info(\"loadChannelInfo > createDdbChannel : \", JSON.stringify(result,\
+              \ null, 2));\n"
+            - "\n"
+            - "        return response(event, context, cfnResp.SUCCESS, {});\n"
+            - "\n"
+            - "        \n"
+            - "    }catch(err){\n"
+            - "        console.log(`Error: ${err}`);\n"
+            - "        return response(event, context, cfnResp.FAILED, {});\n"
+            - "    }\n"
+            - "\n"
+            - "\n"
+            - "\n"
+            - "};\n"
+            - "\n"
+            - "const _createDdbChannel = async (payload, table) => {\n"
+            - "    const params = {\n"
+            - "        TableName: table,\n"
+            - "        Item: {\n"
+            - "            'Id': { S: payload.id },\n"
+            - "            'ChannelArn': { S: payload.channelArn },\n"
+            - "            'IngestServer': { S: payload.ingestServer },\n"
+            - "            'PlaybackUrl': { S: payload.playbackUrl },\n"
+            - "            'Title': { S: payload.title },\n"
+            - "            'Subtitle': { S: payload.subtitle },\n"
+            - "            'StreamKey': { S: payload.streamKey },\n"
+            - "            'StreamArn': { S: payload.streamArn },\n"
+            - "            'IsLive': { BOOL: false }\n"
+            - "        }\n"
+            - "    };\n"
+            - "    \n"
+            - "    const result = await ddb.putItem(params).promise();\n"
+            - "\n"
+            - "    console.info(\"_createDdbChannel > result:\", result);\n"
+            - "\n"
+            - "    return result;\n"
+            - "  \n"
+            - "  };\n"
+            - "\n"
+            - "  function response(event, context, status, responseData) {\n"
+            - "    return new Promise(() => cfnResp.send(event, context, status,\n"
+            - "        responseData ? responseData : {}, event.LogicalResourceId));\n"
+            - "}\n"
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+      Handler: index.handler
+      Role: !GetAtt 'LoadChannelInfoLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Lambda::Function
+  LoadChannelInfoLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:PutItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSChannelTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  PutLive:
+    Properties:
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+      Events:
+        PutResource:
+          Properties:
+            Method: put
+            Path: /live
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.putLiveChannel
+      InlineCode: !Join
+        - ''
+        - - "\n"
+          - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  CHANNELS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "\n"
+          - "// PUT /live\n"
+          - "exports.putLiveChannel = async (event) => {\n"
+          - "    console.log(\"putLiveChannel:\", JSON.stringify(event, null, 2));\n"
+          - "  \n"
+          - "    try {\n"
+          - "  \n"
+          - "      const body = JSON.parse(event.body);\n"
+          - "  \n"
+          - "      const params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          'Id': {\n"
+          - "            S: body.channelName\n"
+          - "          }\n"
+          - "        },\n"
+          - "        ExpressionAttributeNames: {\n"
+          - "          '#Title': 'Title',\n"
+          - "          '#Subtitle': 'Subtitle'\n"
+          - "        },\n"
+          - "        ExpressionAttributeValues: {\n"
+          - "          ':title': {\n"
+          - "            S: body.title\n"
+          - "          },\n"
+          - "          ':subtitle': {\n"
+          - "            S: body.subtitle\n"
+          - "          }\n"
+          - "        },\n"
+          - "        UpdateExpression: 'SET #Title = :title, #Subtitle = :subtitle',\n"
+          - "        ReturnValues: \"ALL_NEW\"\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"putLiveChannel > params:\", JSON.stringify(params,\
+            \ null, 2));\n"
+          - "  \n"
+          - "      const result = await ddb.updateItem(params).promise();\n"
+          - "  \n"
+          - "      console.info(\"putLiveChannel > result:\", JSON.stringify(result,\
+            \ null, 2));\n"
+          - "  \n"
+          - "      return response(result);\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"putLiveChannel > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "  \n"
+          - "    }\n"
+          - "  };\n"
+          - '  '
+      Policies:
+        - AmazonDynamoDBFullAccess
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  PutResetKey:
+    Properties:
+      Environment:
+        Variables:
+          CHANNELS_TABLE_NAME: !Ref 'IVSChannelTable'
+          REGION: !Ref 'AWS::Region'
+      Events:
+        PutResource:
+          Properties:
+            Method: put
+            Path: /reset-key
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.resetStreamKey
+      InlineCode: !Join
+        - ''
+        - - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  CHANNELS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "const ivs = new AWS.IVS({\n"
+          - "  apiVersion: '2020-07-14',\n"
+          - "  REGION // Must be in one of the supported regions\n"
+          - "});\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "  return {\n"
+          - "    statusCode,\n"
+          - "    headers: {\n"
+          - "      'Content-Type': 'application/json',\n"
+          - "      'Access-Control-Allow-Origin': '*'\n"
+          - "    },\n"
+          - "    body: JSON.stringify(body)\n"
+          - "  };\n"
+          - "};\n"
+          - "\n"
+          - "exports.resetStreamKey = async (event) => {\n"
+          - "    console.log(\"resetDefaultStreamKey event:\", JSON.stringify(event,\
+            \ null, 2));\n"
+          - "    let payload;\n"
+          - "    try {\n"
+          - "  \n"
+          - "      payload = JSON.parse(event.body);\n"
+          - "      console.log(`payload `, JSON.stringify(payload));\n"
+          - "      let params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          'Id': {\n"
+          - "            'S': payload.channelName\n"
+          - "          }\n"
+          - "        }\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.log('resetDefaultStreamKey event >  getChannel params',\
+            \ JSON.stringify(params, '', 2));\n"
+          - "  \n"
+          - "      const result = await ddb.getItem(params).promise();\n"
+          - "  \n"
+          - "      if (!result.Item) {\n"
+          - "        console.log('Channel not found');\n"
+          - "        return response({});\n"
+          - "      }\n"
+          - "  \n"
+          - "      const channel = result.Item;\n"
+          - "  \n"
+          - "      const stopStreamParams = {\n"
+          - "        channelArn: channel.ChannelArn.S\n"
+          - "      };\n"
+          - "      console.log(\"resetDefaultStreamKey event > stopStreamParams:\"\
+            , JSON.stringify(stopStreamParams, '', 2));\n"
+          - "  \n"
+          - "      await _stopStream(stopStreamParams);\n"
+          - "  \n"
+          - "      const deleteStreamKeyParams = {\n"
+          - "        arn: channel.StreamArn.S\n"
+          - "      };\n"
+          - "      console.log(\"resetDefaultStreamKey event > deleteStreamKeyParams:\"\
+            , JSON.stringify(deleteStreamKeyParams, '', 2));\n"
+          - "  \n"
+          - "      // Quota limit 1 - delete then add\n"
+          - "  \n"
+          - "      await ivs.deleteStreamKey(deleteStreamKeyParams).promise();\n"
+          - "  \n"
+          - "      const createStreamKeyParams = {\n"
+          - "        channelArn: channel.ChannelArn.S\n"
+          - "      };\n"
+          - "      console.log(\"resetDefaultStreamKey event > createStreamKeyParams:\"\
+            , JSON.stringify(createStreamKeyParams, '', 2));\n"
+          - "  \n"
+          - "      const newStreamKey = await ivs.createStreamKey(createStreamKeyParams).promise();\n"
+          - "  \n"
+          - "      console.log(\" resetDefaultStreamKey event > newStreamKey \", JSON.stringify(newStreamKey));\n"
+          - "  \n"
+          - "      params = {\n"
+          - "        TableName: CHANNELS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          'Id': {\n"
+          - "            S: payload.channelName\n"
+          - "          }\n"
+          - "        },\n"
+          - "        ExpressionAttributeNames: {\n"
+          - "          '#StreamArn': 'StreamArn',\n"
+          - "          '#StreamKey': 'StreamKey'\n"
+          - "        },\n"
+          - "        ExpressionAttributeValues: {\n"
+          - "          ':streamArn': {\n"
+          - "            S: newStreamKey.streamKey.arn\n"
+          - "          },\n"
+          - "          ':streamKey': {\n"
+          - "            S: newStreamKey.streamKey.value\n"
+          - "          }\n"
+          - "        },\n"
+          - "        UpdateExpression: 'SET #StreamArn = :streamArn, #StreamKey =\
+            \ :streamKey',\n"
+          - "        ReturnValues: \"ALL_NEW\"\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"resetDefaultStreamKey > params:\", JSON.stringify(params,\
+            \ null, 2));\n"
+          - "  \n"
+          - "      await ddb.updateItem(params).promise();\n"
+          - "  \n"
+          - "      const key = {\n"
+          - "        \"data\": {\n"
+          - "          \"ingest\": channel.IngestServer.S,\n"
+          - "          \"key\": newStreamKey.streamKey.value\n"
+          - "        }\n"
+          - "      };\n"
+          - "  \n"
+          - "      return response(key, 200);\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"resetDefaultStreamKey > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "  \n"
+          - "    }\n"
+          - "  };\n"
+          - "\n"
+          - "  const _stopStream = async (params) => {\n"
+          - "\n"
+          - "    console.log(\"_stopStream > params:\", JSON.stringify(params, null,\
+            \ 2));\n"
+          - "  \n"
+          - "    try {\n"
+          - "  \n"
+          - "      const result = await ivs.stopStream(params).promise();\n"
+          - "\n"
+          - "      return result;\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"_stopStream > err:\", err);\n"
+          - "      console.info(\"_stopStream > err.stack:\", err.stack);\n"
+          - "  \n"
+          - "      // Ignore error\n"
+          - "      if (/ChannelNotBroadcasting/.test(err)) {\n"
+          - "        return;\n"
+          - "      }\n"
+          - "  \n"
+          - "      throw new Error(err);\n"
+          - "  \n"
+          - "    }\n"
+          - '  };'
+      Role: !GetAtt 'ResetKeyLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  PutVideo:
+    Properties:
+      Environment:
+        Variables:
+          REGION: !Ref 'AWS::Region'
+          VIDEOS_TABLE_NAME: !Ref 'IVSVideoTable'
+      Events:
+        PutResource:
+          Properties:
+            Method: put
+            Path: /video/{id}
+            RestApiId: !Ref 'ApiGateway'
+          Type: Api
+      Handler: index.putVideo
+      InlineCode: !Join
+        - ''
+        - - "const AWS = require('aws-sdk');\n"
+          - "\n"
+          - "const {\n"
+          - "  REGION,\n"
+          - "  VIDEOS_TABLE_NAME\n"
+          - "\n"
+          - "} = process.env;\n"
+          - "\n"
+          - "const ddb = new AWS.DynamoDB();\n"
+          - "\n"
+          - "const response = (body, statusCode = 200) => {\n"
+          - "    return {\n"
+          - "      statusCode,\n"
+          - "      headers: {\n"
+          - "        'Content-Type': 'application/json',\n"
+          - "        'Access-Control-Allow-Origin': '*'\n"
+          - "      },\n"
+          - "      body: JSON.stringify(body)\n"
+          - "    };\n"
+          - "  };\n"
+          - "\n"
+          - "/* PUT /Video/:id */\n"
+          - "exports.putVideo = async (event) => {\n"
+          - "    console.log(\"putVideo:\", JSON.stringify(event, null, 2));\n"
+          - "  \n"
+          - "    if (!event.pathParameters.id) {\n"
+          - "      return response({ message: 'Missing id' }, 400);\n"
+          - "    }\n"
+          - "  \n"
+          - "    try {\n"
+          - "      const payload = JSON.parse(event.body);\n"
+          - "      const params = {\n"
+          - "        TableName: VIDEOS_TABLE_NAME,\n"
+          - "        Key: {\n"
+          - "          'Id': {\n"
+          - "            S: event.pathParameters.id\n"
+          - "          }\n"
+          - "        },\n"
+          - "        ExpressionAttributeNames: {\n"
+          - "          '#Title': 'Title',\n"
+          - "          '#Subtitle': 'Subtitle'\n"
+          - "        },\n"
+          - "        ExpressionAttributeValues: {\n"
+          - "          ':title': {\n"
+          - "            S: payload.title\n"
+          - "          },\n"
+          - "          ':subtitle': {\n"
+          - "            S: payload.subtitle\n"
+          - "          },\n"
+          - "        },\n"
+          - "        UpdateExpression: 'SET #Title = :title, #Subtitle = :subtitle',\n"
+          - "        ReturnValues: \"ALL_NEW\"\n"
+          - "      };\n"
+          - "  \n"
+          - "  \n"
+          - "      if (payload.viewers) {\n"
+          - "        params.ExpressionAttributeNames['#Viewers'] = 'Viewers';\n"
+          - "        params.ExpressionAttributeValues[':viewers'] = {\n"
+          - "          N: String(payload.viewers)\n"
+          - "        };\n"
+          - "  \n"
+          - "        params.UpdateExpression = 'SET #Title = :title, #Subtitle = :subtitle,\
+            \ #Viewers = :viewers';\n"
+          - "      }\n"
+          - "  \n"
+          - "  \n"
+          - "      console.info(\"putVideo > params:\", JSON.stringify(params, null,\
+            \ 2));\n"
+          - "  \n"
+          - "      const result = await ddb.updateItem(params).promise();\n"
+          - "  \n"
+          - "      console.info(\"putVideo > result:\", JSON.stringify(result, null,\
+            \ 2));\n"
+          - "  \n"
+          - "      const updateResponse = {\n"
+          - "        Id: result.Attributes.Id.S ? result.Attributes.Id.S : '',\n"
+          - "        Title: result.Attributes.Title.S ? result.Attributes.Title.S\
+            \ : '',\n"
+          - "        Subtitle: result.Attributes.Subtitle.S ? result.Attributes.Subtitle.S\
+            \ : '',\n"
+          - "        Viewers: result.Attributes.Viewers.N ? parseInt(result.Attributes.Viewers.N,\
+            \ 10) : 0\n"
+          - "      };\n"
+          - "  \n"
+          - "      console.info(\"putVideo > updateResponse :\", JSON.stringify(updateResponse,\
+            \ null, 2));\n"
+          - "  \n"
+          - "      return response(updateResponse);\n"
+          - "  \n"
+          - "    } catch (err) {\n"
+          - "  \n"
+          - "      console.info(\"putVideo > err:\", err);\n"
+          - "      return response(err, 500);\n"
+          - "    }\n"
+          - "  };\n"
+          - '  '
+      Role: !GetAtt 'PutVideoLambdaRole.Arn'
+      Runtime: nodejs12.x
+    Type: AWS::Serverless::Function
+  PutVideoLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:UpdateItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSVideoTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+  ResetKeyLambdaRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ivs:StopStream
+                  - ivs:CreateStreamKey
+                Effect: Allow
+                Resource:
+                  - !Ref 'IVSChannel'
+              - Action:
+                  - ivs:CreateStreamKey
+                  - ivs:DeleteStreamKey
+                  - ivs:GetStreamKey
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:ivs:${AWS::Region}:${AWS::AccountId}:stream-key/*'
+              - Action:
+                  - ivs:CreateStreamKey
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:ivs:${AWS::Region}:${AWS::AccountId}:*'
+            Version: '2012-10-17'
+          PolicyName: ivs-streamkey-access
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IVSChannelTable}'
+            Version: '2012-10-17'
+          PolicyName: dynamodb-access
+    Type: AWS::IAM::Role
+Transform: AWS::Serverless-2016-10-31
