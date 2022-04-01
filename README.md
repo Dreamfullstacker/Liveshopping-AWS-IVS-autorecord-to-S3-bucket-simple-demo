@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Amazon IVS Auto-record to S3 demo web-ui installation instructions
 
 The client app for this demo is built with React.js and is modifiable to suit your implementation needs. This file contains the instructions for setting up your development environment to work with the [serverless backend](../serverless).
@@ -69,3 +70,7 @@ To learn React, check out the [React documentation](https://reactjs.org/).
 ### Deployment
 
 This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
+=======
+# Liveshopping-AWS-IVS-autorecord-to-S3-bucket-simple-demo
+This is simple demo for AWS Interactive Video Service auto record on s3 bucket
+>>>>>>> d99f1a14fa5745e645ec53e39af52a4cbcd99c78
