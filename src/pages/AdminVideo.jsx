@@ -98,6 +98,7 @@ function AdminVideo() {
             setVideoSubtitle(res.subtitle);
             setSelectedThumbnail(res.thumbnail);
             setApiFetched(true);
+            console.log(res.playbackUrl)
           }
           else {
             setResponse(null)

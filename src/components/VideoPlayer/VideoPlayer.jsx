@@ -33,7 +33,7 @@ class VideoPlayer extends Component {
     const videojs = window.videojs,
       registerIVSTech = window.registerIVSTech,
       registerIVSQualityPlugin = window.registerIVSQualityPlugin;
-
+    console.log(videojs);
     // Set up IVS playback tech and quality plugin
     if (registerIVSTech && registerIVSQualityPlugin) {
       registerIVSTech(videojs);
